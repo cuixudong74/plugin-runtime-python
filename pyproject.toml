@@ -10,3 +10,11 @@ dependencies = [
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.4.0",
+]

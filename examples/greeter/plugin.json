@@ -1,0 +1,8 @@
+{
+  "id": "greeter",
+  "version": "1.0.0",
+  "description": "A simple greeting plugin",
+  "capabilities": ["greet"],
+  "requires": [],
+  "entrypoint": "greeter:create_plugin"
+}
