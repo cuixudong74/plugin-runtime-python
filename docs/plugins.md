@@ -81,11 +81,53 @@ HTTP 层解析失败返回 `409` 并携带上述 `reason` 与 `details`。
 
 ### 并发、超时与取消
 
-- 所有生命周期变更由一把异步锁串行化：并发的启用/停用/升级收敛到确定结果，
-  重复请求不会重复加载（加载器对每个版本至多调用一次）。
-- 状态变更集中在一个**无 await 的同步提交点**：超时或取消只会发生在提交点之前
-  （状态未变）或之后（状态已一致），运行时任一时刻都处于一致状态。
-- 操作超时（`timeout` 参数）后旧实例被强制卸载，不会停留在中间状态。
+- **提交点串行、排空并行**：生命周期变更分为两个阶段。阶段一（提交）在一把
+  异步锁内以**无 await 的同步代码**完成解析与状态切换，耗时为微秒级；阶段二
+  （排空旧版本）在**锁外**等待。因此某个插件即使在排空高负载的在途请求，也只
+  占用自己的等待时间，完全不阻塞其它无关插件的启用/停用/升级。
+- **排空语义**：旧版本在提交点即被标记为 draining（不再接受新请求），操作随后
+  等待其在途请求**自然结束**。操作返回时间贴近在途请求的真实结束时间（事件
+  通知，毫秒级多余等待），而不是干等到排空上限；`drain_timeout`（默认 30s）只
+  是在途请求迟迟不结束时的兜底上限。
+- **在途请求**：切换瞬间之前已进入旧版本的请求在旧版本上跑完，全部跑完后旧
+  版本才卸载；切换瞬间之后的新请求只会落到新版本。任何时刻对外暴露的都是
+  某个完整版本，绝不新旧混合。与提交点恰好竞争的调用会被透明地重新路由到
+  新版本；插件被停用后到达的调用得到可区分的拒绝
+  （`PluginStateError: ... is not enabled`，HTTP `409`），不会抛出含义不明的
+  中间态错误。
+- **确定性**：所有状态变更集中在同步提交点，并发的启用/停用/升级按提交顺序
+  收敛到一致结果；重复请求是幂等 no-op，同一逻辑操作重复到达不会重复加载
+  （加载器对每个启用周期内的同一版本至多调用一次）。
+- **超时与取消**：超时或取消只会发生在提交点之前（状态未变）或之后的排空
+  等待中（状态已一致），运行时任一时刻都处于一致状态，没有任何插件会卡在
+  无法恢复的中间状态。操作超时（`timeout` 参数，默认取 `drain_timeout`）后
+  旧实例被强制卸载；由于排空不持锁，超时/取消的操作不会拖住后续任何操作，
+  对同一插件的后续操作也能正常进行。
+- **失败计数**：失败/成功计数由锁保护，多线程并发失败不会丢失也不会重复
+  累计；连续失败恰好达到阈值时进入隔离，隔离后的调用快速失败且不再进入
+  插件代码。
+
+### 验证方法
+
+`tests/test_concurrency.py` 稳定复现并验证上述行为：
+
+- `test_upgrade_returns_when_in_flight_finishes_not_at_cap` /
+  `test_disable_returns_when_in_flight_finishes_not_at_cap`：在途请求 0.5s
+  结束、排空上限 10s，断言操作在远小于上限的时间内返回；
+- `test_unrelated_lifecycle_ops_not_blocked_by_draining_plugin`：插件 A 排空
+  期间对无关插件做启用/停用/升级，断言其在 A 排空结束前完成；
+- `test_calls_during_upgrade_always_land_on_a_complete_version` /
+  `test_calls_during_disable_succeed_or_get_clear_rejection`：多线程并发调用
+  与升级/停用竞争，断言结果要么是某个完整版本的正常返回、要么是可区分的
+  "not enabled" 拒绝；
+- `test_concurrent_batch_ops_converge_without_duplicate_loads`：批量并发操作
+  收敛到确定状态且无重复加载；
+- `test_concurrent_failures_are_counted_exactly` /
+  `test_concurrent_failures_trip_quarantine_and_fail_fast`：并发失败计数精确、
+  隔离稳定且隔离后快速失败；
+- `test_timeout_during_drain_blocks_nobody_and_plugin_recovers` /
+  `test_cancel_during_drain_leaves_runtime_usable`：超时/取消后运行时一致、
+  无关操作不被拖住、同插件后续操作可正常恢复。
 
 ### 失败隔离
 
@@ -124,4 +166,5 @@ uv run python -m pytest tests/ -q
 ```
 
 覆盖：清单校验、版本冲突、环形依赖、解析确定性、并发启停/升级、升级排空、
-超时与取消、失败隔离与恢复、权限拒绝与审计、HTTP 端到端生命周期。
+排空返回时机、无关插件操作互不阻塞、并发失败计数、超时与取消、失败隔离与
+恢复、权限拒绝与审计、HTTP 端到端生命周期。

@@ -1,14 +1,20 @@
 """The plugin runtime: install, enable, disable and upgrade plugins
 without restarting the host.
 
-Concurrency model: a single async lock serializes lifecycle mutations,
-so concurrent enable/disable/upgrade requests converge to a deterministic
-result and duplicate requests are idempotent. All state mutation happens
-in a single synchronous swap with no awaits in between, so a timeout or
-cancellation can never leave the runtime in a half-mutated state: either
-the swap happened (new consistent state) or it did not (old consistent
-state). Old versions are drained after the swap; callers therefore always
-see exactly one complete version per plugin.
+Concurrency model: an async lock serializes the *commit section* of every
+lifecycle mutation, so concurrent enable/disable/upgrade requests converge
+to a deterministic result and duplicate requests are idempotent. All state
+mutation happens in a single synchronous swap with no awaits in between, so
+a timeout or cancellation can never leave the runtime in a half-mutated
+state: either the swap happened (new consistent state) or it did not (old
+consistent state).
+
+Draining of old versions happens *outside* the lock: the lock is only held
+for the microsecond-scale commit, never while waiting for in-flight
+requests. A slow drain of one plugin therefore never blocks lifecycle
+operations on unrelated plugins, and a lifecycle operation returns as soon
+as the last in-flight request on the old version finishes (bounded by the
+drain timeout), not when some fixed grace period expires.
 """
 
 from __future__ import annotations
@@ -177,7 +183,9 @@ class PluginRuntime:
         """Swap instances to match the plan. Returns old instances to drain.
 
         This method is fully synchronous: no cancellation point exists
-        between the first and the last mutation.
+        between the first and the last mutation. Replaced/removed instances
+        are marked draining *at the commit point*, so a request that is
+        routed afterwards can never pin a version that nobody will wait for.
         """
         old_instances: list[PluginInstance] = []
         new_instances: dict[str, PluginInstance] = {}
@@ -192,40 +200,56 @@ class PluginRuntime:
         for pid in remove:
             old = self._enabled.pop(pid, None)
             if old is not None:
+                old.begin_drain()
                 old_instances.append(old)
             self._disabled.add(pid)
         for pid, inst in new_instances.items():
             old = self._enabled.get(pid)
-            if old is not None:
-                old_instances.append(old)
+            # Publish the new version first, then stop the old one: a
+            # concurrent caller always finds a complete, usable version.
             self._enabled[pid] = inst
+            if old is not None:
+                old.begin_drain()
+                old_instances.append(old)
             self._disabled.discard(pid)
         return old_instances
 
     async def _drain_all(self, old_instances: list[PluginInstance], deadline: float) -> None:
-        """Drain old versions; on timeout they are force-unloaded so the
-        runtime never lingers in an intermediate state."""
-        for inst in old_instances:
-            inst.begin_drain()
+        """Wait for old versions to finish their in-flight requests.
+
+        Runs *outside* the lifecycle lock, so a slow drain never blocks
+        unrelated plugins. Returns as soon as every old instance is drained
+        (i.e. as soon as the last in-flight request finishes); on timeout
+        the wait is abandoned — the instances are already detached from the
+        routing table, so the runtime stays consistent and nothing is left
+        stuck in an intermediate state.
+        """
         for inst in old_instances:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             await asyncio.to_thread(inst.wait_drained, remaining)
-        # Anything not drained by now is dropped; the enabled set is
-        # already consistent, so this is safe.
 
-    async def _serialized(self, timeout: float | None, body) -> Any:
-        """Run ``body`` under the global lock with an overall timeout."""
+    async def _run_lifecycle(self, plugin_id: str, timeout: float | None, commit) -> PluginInfo:
+        """Run one lifecycle operation.
+
+        ``commit`` is a synchronous callable executed under the lock; it
+        performs resolution and the atomic state swap and returns the old
+        instances to drain. The drain wait happens after the lock is
+        released, within the same overall timeout.
+        """
         effective = timeout if timeout is not None else self._drain_timeout
+        deadline = time.monotonic() + effective
         try:
             async with asyncio.timeout(effective):
                 async with self._lock:
-                    return await body(time.monotonic() + effective)
+                    old_instances = commit()
+                await self._drain_all(old_instances, deadline)
         except TimeoutError as exc:
             raise PluginRuntimeError(
                 "operation timed out; runtime left in a consistent state"
             ) from exc
+        return self._info(plugin_id)
 
     # ------------------------------------------------------------------
     # installation
@@ -244,27 +268,24 @@ class PluginRuntime:
     # ------------------------------------------------------------------
     async def enable(self, plugin_id: str, timeout: float | None = None) -> PluginInfo:
         """Resolve dependencies and activate a consistent plugin set."""
-        async def body(deadline: float) -> PluginInfo:
+        def commit() -> list[PluginInstance]:
             if plugin_id not in self._installed:
                 raise PluginStateError(f"plugin '{plugin_id}' is not installed")
-            current = self._enabled.get(plugin_id)
-            if current is not None:
-                return self._info(plugin_id)  # idempotent
+            if self._enabled.get(plugin_id) is not None:
+                return []  # idempotent
             plan = self._resolve_for_enable(plugin_id)
-            old = self._apply_plan(plan, remove=set())
-            await self._drain_all(old, deadline)
-            return self._info(plugin_id)
+            return self._apply_plan(plan, remove=set())
 
-        return await self._serialized(timeout, body)
+        return await self._run_lifecycle(plugin_id, timeout, commit)
 
     async def disable(self, plugin_id: str, timeout: float | None = None) -> PluginInfo:
         """Drain and deactivate a plugin together with its dependents."""
-        async def body(deadline: float) -> PluginInfo:
+        def commit() -> list[PluginInstance]:
             if plugin_id not in self._installed:
                 raise PluginStateError(f"plugin '{plugin_id}' is not installed")
             if plugin_id not in self._enabled:
                 self._disabled.add(plugin_id)
-                return self._info(plugin_id)  # idempotent
+                return []  # idempotent
             # Everything depending (transitively) on the target must go too.
             removed = {plugin_id}
             changed = True
@@ -282,17 +303,15 @@ class PluginRuntime:
                 if pid not in removed
             }
             plan = resolve(remaining, self._candidates_for(set(remaining)))
-            old = self._apply_plan(plan, remove=removed)
-            await self._drain_all(old, deadline)
-            return self._info(plugin_id)
+            return self._apply_plan(plan, remove=removed)
 
-        return await self._serialized(timeout, body)
+        return await self._run_lifecycle(plugin_id, timeout, commit)
 
     async def upgrade(self, plugin_id: str, timeout: float | None = None) -> PluginInfo:
         """Switch to the newest resolvable version; the old version is
         drained (in-flight requests finish) before it is unloaded, so
         callers always see exactly one complete version."""
-        async def body(deadline: float) -> PluginInfo:
+        def commit() -> list[PluginInstance]:
             if plugin_id not in self._installed:
                 raise PluginStateError(f"plugin '{plugin_id}' is not installed")
             # Re-resolve with the target's pool ordered newest-first by
@@ -320,11 +339,9 @@ class PluginRuntime:
                     raise
             if plan is None:
                 raise PluginRuntimeError("dependency closure did not converge")
-            old = self._apply_plan(plan, remove=set())
-            await self._drain_all(old, deadline)
-            return self._info(plugin_id)
+            return self._apply_plan(plan, remove=set())
 
-        return await self._serialized(timeout, body)
+        return await self._run_lifecycle(plugin_id, timeout, commit)
 
     # ------------------------------------------------------------------
     # queries
@@ -357,6 +374,9 @@ class PluginRuntime:
 
         The instance is pinned for the duration of the call, so an
         upgrade happening concurrently drains rather than interrupts it.
+        A call that races with a lifecycle commit is transparently
+        re-routed to the newly published version; it never observes a
+        half-swapped routing table.
         """
         attempts = 0
         while True:
@@ -366,9 +386,17 @@ class PluginRuntime:
             try:
                 inst.acquire()
             except PluginStateError:
+                # The instance we read was swapped out and is draining.
+                # Draining starts at the commit point, which also publishes
+                # the successor (or removes the plugin), so a retry lands
+                # on a complete, current version or gets a clear
+                # "not enabled" rejection — never a half-swapped state.
                 attempts += 1
-                if attempts > 3:
-                    raise
+                if attempts > 10:
+                    raise PluginStateError(
+                        f"plugin '{plugin_id}' is in the middle of a "
+                        f"lifecycle change; retry the call"
+                    )
                 await asyncio.sleep(0)
                 continue
             try:
