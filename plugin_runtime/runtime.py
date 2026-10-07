@@ -1,14 +1,24 @@
 """The plugin runtime: install, enable, disable and upgrade plugins
 without restarting the host.
 
-Concurrency model: a single async lock serializes lifecycle mutations,
-so concurrent enable/disable/upgrade requests converge to a deterministic
-result and duplicate requests are idempotent. All state mutation happens
-in a single synchronous swap with no awaits in between, so a timeout or
-cancellation can never leave the runtime in a half-mutated state: either
-the swap happened (new consistent state) or it did not (old consistent
-state). Old versions are drained after the swap; callers therefore always
-see exactly one complete version per plugin.
+Concurrency model: a single async lock serializes the *commit* of every
+lifecycle mutation (resolve + load + atomic swap + begin-drain). The
+commit is fully synchronous — no awaits between the first and the last
+mutation — so a timeout or cancellation can never leave the runtime in
+a half-mutated state: either the swap happened (new consistent state)
+or it did not (old consistent state).
+
+Draining (waiting for in-flight requests on old versions to finish)
+happens *after* the commit, outside the lock. One plugin draining
+therefore never blocks lifecycle operations on unrelated plugins, and
+the draining wait itself is event-driven: the operation returns as soon
+as the last in-flight request finishes, not when the drain timeout
+expires. The timeout is only an upper bound for stuck requests.
+
+Callers always see exactly one complete version per plugin: the old
+version stops accepting new requests at the commit instant and is
+unloaded once its in-flight requests finish; new requests land on the
+new version (or get a clear "not enabled" rejection after a disable).
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ from .errors import (
     ResolutionError,
     ResolutionErrorReason,
 )
-from .isolation import HealthState, PluginHealth
+from .isolation import PluginHealth
 from .manifest import PluginManifest
 from .permissions import AuditLog, PermissionChecker
 from .plugin import PluginContext, PluginInstance
@@ -56,6 +66,11 @@ class PluginInfo:
 # Loader: given a manifest, return the plugin object (must expose the
 # declared capabilities as callables). Raises on load failure.
 PluginLoader = Callable[[PluginManifest], Any]
+
+
+def _set_if_pending(fut: asyncio.Future) -> None:
+    if not fut.done():
+        fut.set_result(None)
 
 
 def _default_loader(manifest: PluginManifest) -> Any:
@@ -111,7 +126,7 @@ class PluginRuntime:
 
     def _status_of(self, plugin_id: str) -> PluginStatus:
         health = self._health_of(plugin_id)
-        if health.state is HealthState.QUARANTINED:
+        if health.is_quarantined:
             return PluginStatus.QUARANTINED
         if plugin_id in self._enabled:
             return PluginStatus.ENABLED
@@ -177,7 +192,10 @@ class PluginRuntime:
         """Swap instances to match the plan. Returns old instances to drain.
 
         This method is fully synchronous: no cancellation point exists
-        between the first and the last mutation.
+        between the first and the last mutation. Replaced/removed
+        instances stop accepting new requests at the commit instant
+        (``begin_drain``), so the old version never serves alongside the
+        new one; it only finishes requests already in flight.
         """
         old_instances: list[PluginInstance] = []
         new_instances: dict[str, PluginInstance] = {}
@@ -200,28 +218,54 @@ class PluginRuntime:
                 old_instances.append(old)
             self._enabled[pid] = inst
             self._disabled.discard(pid)
-        return old_instances
-
-    async def _drain_all(self, old_instances: list[PluginInstance], deadline: float) -> None:
-        """Drain old versions; on timeout they are force-unloaded so the
-        runtime never lingers in an intermediate state."""
         for inst in old_instances:
             inst.begin_drain()
+        return old_instances
+
+    async def _wait_drained(self, old_instances: list[PluginInstance], deadline: float) -> None:
+        """Wait for old versions to drain, outside the mutation lock.
+
+        The wait is event-driven: it returns as soon as the last
+        in-flight request finishes, not when the deadline arrives, and
+        it is cancellable without leaving blocked waiter threads behind
+        (no ``asyncio.to_thread`` on a threading.Event). On timeout the
+        remaining instances are dropped (the enabled set is already
+        consistent), so the runtime never lingers in an intermediate
+        state.
+        """
+        loop = asyncio.get_running_loop()
         for inst in old_instances:
+            if inst.drained:
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            await asyncio.to_thread(inst.wait_drained, remaining)
+            fut: asyncio.Future = loop.create_future()
+
+            def _resolve(f: asyncio.Future = fut) -> None:
+                try:
+                    loop.call_soon_threadsafe(_set_if_pending, f)
+                except RuntimeError:  # loop already closed
+                    pass
+
+            inst.on_drained(_resolve)
+            try:
+                await asyncio.wait_for(fut, remaining)
+            except TimeoutError:
+                pass  # dropped; the enabled set is already consistent
         # Anything not drained by now is dropped; the enabled set is
         # already consistent, so this is safe.
 
     async def _serialized(self, timeout: float | None, body) -> Any:
-        """Run ``body`` under the global lock with an overall timeout."""
+        """Run ``body`` with an overall timeout.
+
+        ``body`` receives the operation deadline; it commits state under
+        the lock and drains afterwards, outside the lock.
+        """
         effective = timeout if timeout is not None else self._drain_timeout
         try:
             async with asyncio.timeout(effective):
-                async with self._lock:
-                    return await body(time.monotonic() + effective)
+                return await body(time.monotonic() + effective)
         except TimeoutError as exc:
             raise PluginRuntimeError(
                 "operation timed out; runtime left in a consistent state"
@@ -245,14 +289,15 @@ class PluginRuntime:
     async def enable(self, plugin_id: str, timeout: float | None = None) -> PluginInfo:
         """Resolve dependencies and activate a consistent plugin set."""
         async def body(deadline: float) -> PluginInfo:
-            if plugin_id not in self._installed:
-                raise PluginStateError(f"plugin '{plugin_id}' is not installed")
-            current = self._enabled.get(plugin_id)
-            if current is not None:
-                return self._info(plugin_id)  # idempotent
-            plan = self._resolve_for_enable(plugin_id)
-            old = self._apply_plan(plan, remove=set())
-            await self._drain_all(old, deadline)
+            async with self._lock:
+                if plugin_id not in self._installed:
+                    raise PluginStateError(f"plugin '{plugin_id}' is not installed")
+                current = self._enabled.get(plugin_id)
+                if current is not None:
+                    return self._info(plugin_id)  # idempotent
+                plan = self._resolve_for_enable(plugin_id)
+                old = self._apply_plan(plan, remove=set())
+            await self._wait_drained(old, deadline)
             return self._info(plugin_id)
 
         return await self._serialized(timeout, body)
@@ -260,30 +305,31 @@ class PluginRuntime:
     async def disable(self, plugin_id: str, timeout: float | None = None) -> PluginInfo:
         """Drain and deactivate a plugin together with its dependents."""
         async def body(deadline: float) -> PluginInfo:
-            if plugin_id not in self._installed:
-                raise PluginStateError(f"plugin '{plugin_id}' is not installed")
-            if plugin_id not in self._enabled:
-                self._disabled.add(plugin_id)
-                return self._info(plugin_id)  # idempotent
-            # Everything depending (transitively) on the target must go too.
-            removed = {plugin_id}
-            changed = True
-            while changed:
-                changed = False
-                for pid, inst in self._enabled.items():
-                    if pid in removed:
-                        continue
-                    if any(d.plugin_id in removed for d in inst.manifest.dependencies):
-                        removed.add(pid)
-                        changed = True
-            remaining = {
-                pid: inst.manifest
-                for pid, inst in self._enabled.items()
-                if pid not in removed
-            }
-            plan = resolve(remaining, self._candidates_for(set(remaining)))
-            old = self._apply_plan(plan, remove=removed)
-            await self._drain_all(old, deadline)
+            async with self._lock:
+                if plugin_id not in self._installed:
+                    raise PluginStateError(f"plugin '{plugin_id}' is not installed")
+                if plugin_id not in self._enabled:
+                    self._disabled.add(plugin_id)
+                    return self._info(plugin_id)  # idempotent
+                # Everything depending (transitively) on the target must go too.
+                removed = {plugin_id}
+                changed = True
+                while changed:
+                    changed = False
+                    for pid, inst in self._enabled.items():
+                        if pid in removed:
+                            continue
+                        if any(d.plugin_id in removed for d in inst.manifest.dependencies):
+                            removed.add(pid)
+                            changed = True
+                remaining = {
+                    pid: inst.manifest
+                    for pid, inst in self._enabled.items()
+                    if pid not in removed
+                }
+                plan = resolve(remaining, self._candidates_for(set(remaining)))
+                old = self._apply_plan(plan, remove=removed)
+            await self._wait_drained(old, deadline)
             return self._info(plugin_id)
 
         return await self._serialized(timeout, body)
@@ -293,35 +339,36 @@ class PluginRuntime:
         drained (in-flight requests finish) before it is unloaded, so
         callers always see exactly one complete version."""
         async def body(deadline: float) -> PluginInfo:
-            if plugin_id not in self._installed:
-                raise PluginStateError(f"plugin '{plugin_id}' is not installed")
-            # Re-resolve with the target's pool ordered newest-first by
-            # excluding it from the "keep current" map.
-            enabled_map = {
-                pid: inst.manifest
-                for pid, inst in self._enabled.items()
-                if pid != plugin_id
-            }
-            participants = set(enabled_map) | {plugin_id}
-            plan = None
-            for _ in range(len(self._installed) + 2):
-                try:
-                    plan = resolve(enabled_map, self._candidates_for(participants))
-                    break
-                except ResolutionError as exc:
-                    missing = exc.details.get("missing")
-                    if (
-                        exc.reason is ResolutionErrorReason.UNKNOWN_DEPENDENCY
-                        and missing in self._installed
-                        and missing not in participants
-                    ):
-                        participants.add(missing)
-                        continue
-                    raise
-            if plan is None:
-                raise PluginRuntimeError("dependency closure did not converge")
-            old = self._apply_plan(plan, remove=set())
-            await self._drain_all(old, deadline)
+            async with self._lock:
+                if plugin_id not in self._installed:
+                    raise PluginStateError(f"plugin '{plugin_id}' is not installed")
+                # Re-resolve with the target's pool ordered newest-first by
+                # excluding it from the "keep current" map.
+                enabled_map = {
+                    pid: inst.manifest
+                    for pid, inst in self._enabled.items()
+                    if pid != plugin_id
+                }
+                participants = set(enabled_map) | {plugin_id}
+                plan = None
+                for _ in range(len(self._installed) + 2):
+                    try:
+                        plan = resolve(enabled_map, self._candidates_for(participants))
+                        break
+                    except ResolutionError as exc:
+                        missing = exc.details.get("missing")
+                        if (
+                            exc.reason is ResolutionErrorReason.UNKNOWN_DEPENDENCY
+                            and missing in self._installed
+                            and missing not in participants
+                        ):
+                            participants.add(missing)
+                            continue
+                        raise
+                if plan is None:
+                    raise PluginRuntimeError("dependency closure did not converge")
+                old = self._apply_plan(plan, remove=set())
+            await self._wait_drained(old, deadline)
             return self._info(plugin_id)
 
         return await self._serialized(timeout, body)
@@ -357,6 +404,10 @@ class PluginRuntime:
 
         The instance is pinned for the duration of the call, so an
         upgrade happening concurrently drains rather than interrupts it.
+        A call that arrives while its target version is being swapped out
+        retries briefly and lands on the new version; if the plugin is
+        disabled (or stays mid-swap for an unreasonably long time) the
+        call is rejected with a clear, distinguishable PluginStateError.
         """
         attempts = 0
         while True:
@@ -366,10 +417,15 @@ class PluginRuntime:
             try:
                 inst.acquire()
             except PluginStateError:
+                # The pinned instance was swapped out and is draining;
+                # retry to land on the version that replaced it.
                 attempts += 1
-                if attempts > 3:
-                    raise
-                await asyncio.sleep(0)
+                if attempts > 100:
+                    raise PluginStateError(
+                        f"plugin '{plugin_id}' is being reconfigured; "
+                        "retry the call"
+                    )
+                await asyncio.sleep(0.01)
                 continue
             try:
                 return inst.execute(capability, *args, **kwargs)

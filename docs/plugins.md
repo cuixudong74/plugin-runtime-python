@@ -81,11 +81,29 @@ HTTP 层解析失败返回 `409` 并携带上述 `reason` 与 `details`。
 
 ### 并发、超时与取消
 
-- 所有生命周期变更由一把异步锁串行化：并发的启用/停用/升级收敛到确定结果，
-  重复请求不会重复加载（加载器对每个版本至多调用一次）。
-- 状态变更集中在一个**无 await 的同步提交点**：超时或取消只会发生在提交点之前
-  （状态未变）或之后（状态已一致），运行时任一时刻都处于一致状态。
-- 操作超时（`timeout` 参数）后旧实例被强制卸载，不会停留在中间状态。
+- **提交与排空分离**：所有生命周期变更的状态提交（解析 → 加载 → 原子切换 →
+  旧版本开始排空）由一把异步锁串行化，且提交点内**没有任何 await**，因此超时或
+  取消只会发生在提交点之前（状态未变）或之后（状态已一致），运行时任一时刻都
+  处于一致状态。并发的启用/停用/升级收敛到确定结果，重复请求不会重复加载
+  （加载器对每个版本至多调用一次）。
+- **排空不阻塞无关插件**：等待在途请求结束（排空）发生在提交之后、锁之外。
+  某个插件正在排空时，对其它插件的启用/停用/升级只需等待一次毫秒级的状态
+  提交，不会被排空拖住。
+- **排空是事件驱动的**：操作会等到在途请求自然结束，并在最后一个在途请求
+  完成的瞬间返回——而不是干等到排空上限。`drain_timeout`（默认 30s）与
+  `timeout` 参数只是"卡死请求"的安全上限，不是常规等待时间。
+- **在途请求与新调用的去向**：切换提交的瞬间旧版本即停止接受新请求；仍在
+  处理中的旧请求在旧版本上跑完，全部跑完后旧版本才卸载。升级期间发起的新
+  调用自动落到新版本；停用提交后发起的新调用得到明确的
+  `PluginStateError("... not enabled")`（HTTP `409`），不会抛出含义不明的
+  中间态错误，也不会出现新旧版本同时对外服务。
+- **超时与取消不留残骸**：排空等待基于回调而非阻塞线程，操作超时或被取消时
+  不会遗留卡住的等待线程；已提交的状态保持一致（新版本服务/插件已停用），
+  未提交的状态维持原样，任何插件都可以通过再次 `enable`/`disable`/`upgrade`
+  恢复正常，不存在卡死的中间状态。
+- **失败计数并发准确**：健康计数器内部加锁，多个请求同时失败时计数既不丢失
+  也不重复累计；连续失败达到阈值后稳定进入隔离，隔离后的调用快速失败
+  （`QuarantinedError`，HTTP `423`），原因与恢复方式可查询。
 
 ### 失败隔离
 
@@ -125,3 +143,26 @@ uv run python -m pytest tests/ -q
 
 覆盖：清单校验、版本冲突、环形依赖、解析确定性、并发启停/升级、升级排空、
 超时与取消、失败隔离与恢复、权限拒绝与审计、HTTP 端到端生命周期。
+
+### 并发与排空语义的验证方法
+
+`tests/test_concurrency.py` 稳定复现并钉住以下场景，可作为上线前的验证清单：
+
+- `test_disable_returns_when_in_flight_finishes_not_at_timeout` /
+  `test_upgrade_returns_when_in_flight_finishes_not_at_timeout`：
+  在途请求期间发起停用/升级，操作返回时间贴近在途请求真实结束时间，
+  远低于 30s 的排空上限；
+- `test_draining_plugin_does_not_block_unrelated_operations`：
+  一个插件排空期间，无关插件的启用/停用/升级在秒级内完成；
+- `test_invokes_during_upgrade_always_land_on_a_complete_version` /
+  `test_invokes_during_disable_succeed_or_get_clear_rejection`：
+  升级/停用期间的调用要么落到完整版本，要么得到明确的 `not enabled` 拒绝；
+- `test_concurrent_failures_counted_exactly` /
+  `test_concurrent_failures_quarantine_stably_and_fail_fast`：
+  并发失败计数精确、隔离稳定且隔离后快速失败；
+- `test_disable_timeout_leaves_consistent_recoverable_state` /
+  `test_cancelled_disable_leaves_consistent_state`：
+  超时与取消之后状态一致且可恢复；
+- `test_concurrent_duplicate_ops_converge_without_duplicate_loads` /
+  `test_high_load_storm_always_recovers_to_a_consistent_state`：
+  批量并发操作收敛到一致结果，不重复加载，不留卡死状态。

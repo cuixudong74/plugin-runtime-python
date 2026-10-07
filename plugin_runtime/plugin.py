@@ -11,7 +11,7 @@ from .errors import (
     PluginStateError,
     QuarantinedError,
 )
-from .isolation import HealthState, PluginHealth
+from .isolation import PluginHealth
 from .manifest import PluginManifest
 from .permissions import PermissionChecker
 
@@ -62,6 +62,7 @@ class PluginInstance:
         self._in_flight = 0
         self._draining = False
         self._drained = threading.Event()
+        self._drained_callbacks: list[Callable[[], None]] = []
 
     @property
     def manifest(self) -> PluginManifest:
@@ -79,6 +80,10 @@ class PluginInstance:
     def draining(self) -> bool:
         with self._lock:
             return self._draining
+
+    @property
+    def drained(self) -> bool:
+        return self._drained.is_set()
 
     @property
     def in_flight(self) -> int:
@@ -101,15 +106,42 @@ class PluginInstance:
             if self._in_flight <= 0:
                 raise PluginStateError("release without matching acquire")
             self._in_flight -= 1
-            if self._draining and self._in_flight == 0:
-                self._drained.set()
+            callbacks = self._drain_complete_locked()
+        for cb in callbacks:
+            cb()
 
     def begin_drain(self) -> None:
         """Stop accepting new requests; unload once in-flight ones finish."""
         with self._lock:
             self._draining = True
-            if self._in_flight == 0:
-                self._drained.set()
+            callbacks = self._drain_complete_locked()
+        for cb in callbacks:
+            cb()
+
+    def _drain_complete_locked(self) -> list[Callable[[], None]]:
+        """Mark drained if appropriate; return callbacks to fire.
+
+        Must be called with ``self._lock`` held; the returned callbacks
+        must be invoked after the lock is released.
+        """
+        if self._draining and self._in_flight == 0 and not self._drained.is_set():
+            self._drained.set()
+            callbacks, self._drained_callbacks = self._drained_callbacks, []
+            return callbacks
+        return []
+
+    def on_drained(self, callback: Callable[[], None]) -> None:
+        """Invoke ``callback`` once this instance is fully drained.
+
+        If already drained, the callback is invoked immediately. The
+        callback may be invoked from any thread (whichever thread
+        releases the last in-flight request).
+        """
+        with self._lock:
+            if not self._drained.is_set():
+                self._drained_callbacks.append(callback)
+                return
+        callback()
 
     def wait_drained(self, timeout: float | None = None) -> bool:
         """Block until drained; returns False on timeout."""
@@ -117,11 +149,9 @@ class PluginInstance:
 
     def execute(self, capability: str, *args: Any, **kwargs: Any) -> Any:
         """Call into the plugin, recording failures for isolation."""
-        if self._health.state is HealthState.QUARANTINED:
-            raise QuarantinedError(
-                self._manifest.plugin_id,
-                self._health.quarantine_reason or "quarantined",
-            )
+        reason = self._health.quarantined_reason()
+        if reason is not None:
+            raise QuarantinedError(self._manifest.plugin_id, reason)
         if capability not in self._manifest.capabilities:
             raise PluginRuntimeError(
                 f"plugin '{self._manifest.plugin_id}' does not expose "
